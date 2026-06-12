@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, session, ipcMain, dialog, Menu, clipboard, globalShortcut } = require('electron');
 const path   = require('path');
 const fs     = require('fs');
 const http   = require('http');
@@ -6,7 +6,12 @@ const https  = require('https');
 const os     = require('os');
 const { exec } = require('child_process');
 
+const { createStore } = require('./store.js');
+
 const isDev  = !app.isPackaged;
+
+// ── Persistent data store (JSON files) ───────────────────────
+let store = null;
 let   localPort = 0;
 let   localServer = null;
 
@@ -168,6 +173,139 @@ async function loadExtensions() {
       console.warn('Extension failed:', entry.name, e.message);
     }
   }
+}
+
+// ── Data store IPC ─────────────────────────────────────────────
+function setupDataIpc() {
+  // Bookmarks
+  ipcMain.handle('store:loadBookmarks',    () => store.loadBookmarks());
+  ipcMain.handle('store:saveBookmarks',    (_, list) => { store.saveBookmarks(list); });
+
+  // History
+  ipcMain.handle('store:loadHistory',      () => store.loadHistory());
+  ipcMain.handle('store:saveHistory',      (_, list) => { store.saveHistory(list); });
+  ipcMain.handle('store:clearHistory',     () => store.clearHistory());
+
+  // Chat sessions
+  ipcMain.handle('store:loadChatSessions', () => store.loadChatSessions());
+  ipcMain.handle('store:saveChatSessions', (_, list) => { store.saveChatSessions(list); });
+
+  // Settings
+  ipcMain.handle('store:loadSettings',     () => store.loadSettings());
+  ipcMain.handle('store:saveSettings',     (_, s) => { store.saveSettings(s); });
+
+  // History — delete by time range
+  ipcMain.handle('store:deleteHistoryByAge', (_, cutoffMs) => {
+    store.deleteHistoryByAge(cutoffMs);
+  });
+}
+
+// ── Context menu IPC ────────────────────────────────────────────
+function setupContextMenuIpc() {
+  ipcMain.handle('context-menu:show-link', (_, url) => {
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return;
+
+    const template = [
+      {
+        label: '在新分頁開啟連結',
+        click: () => win.webContents.send('context-action', { action: 'new-tab', url }),
+      },
+      { type: 'separator' },
+      {
+        label: '複製連結網址',
+        click: () => { clipboard.writeText(url); },
+      },
+    ];
+    const menu = Menu.buildFromTemplate(template);
+    menu.popup({ window: win });
+  });
+
+  ipcMain.handle('context-menu:show-text', (_, text) => {
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return;
+    const template = [
+      { label: '複製選取文字', click: () => { clipboard.writeText(text); } },
+    ];
+    const menu = Menu.buildFromTemplate(template);
+    menu.popup({ window: win });
+  });
+
+  ipcMain.handle('context-menu:show-page', () => {
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return;
+
+    const template = [
+      {
+        label: '上一頁',
+        accelerator: 'Alt+Left',
+        click: () => win.webContents.goBack(),
+      },
+      {
+        label: '下一頁',
+        accelerator: 'Alt+Right',
+        click: () => win.webContents.goForward(),
+      },
+      { type: 'separator' },
+      {
+        label: '重新整理',
+        accelerator: 'CmdOrCtrl+R',
+        click: () => win.webContents.reload(),
+      },
+      { type: 'separator' },
+      {
+        label: '檢查元素 (DevTools)',
+        accelerator: 'F12',
+        click: () => win.webContents.openDevTools({ mode: 'detach' }),
+      },
+    ];
+    const menu = Menu.buildFromTemplate(template);
+    menu.popup({ window: win });
+  });
+
+  // Open DevTools for a specific webview by its webContentsId
+  ipcMain.handle('devtools:open-webview', (_, { webContentsId, mode }) => {
+    const wc = require('electron').webContents.fromId(webContentsId);
+    if (wc) {
+      wc.openDevTools({ mode: mode || 'right' });
+    }
+  });
+
+  // Save/load the preferred devtools dock mode
+  ipcMain.handle('devtools:getMode', () => store.loadSettings().devtoolsMode || 'right');
+  ipcMain.handle('devtools:setMode', (_, mode) => {
+    const s = store.loadSettings();
+    s.devtoolsMode = mode;
+    store.saveSettings(s);
+  });
+
+  // IPC handler to toggle DevTools on the focused webview (from renderer)
+  ipcMain.handle('devtools:toggle-webview', async (_, webContentsId) => {
+    console.log('[DevTools] toggle-webview called with id:', webContentsId);
+    if (!webContentsId) return;
+    const wc = require('electron').webContents.fromId(webContentsId);
+    if (!wc) {
+      console.log('[DevTools] webContents not found for id:', webContentsId);
+      return;
+    }
+    if (wc.isDevToolsOpened()) {
+      console.log('[DevTools] closing');
+      wc.closeDevTools();
+    } else {
+      // Always use detach mode so the DevTools window is visible
+      // regardless of webview size
+      wc.openDevTools({ mode: 'detach' });
+    }
+  });
+
+  ipcMain.handle('devtools:open-main', () => {
+    console.log('[DevTools] open-main called');
+    const win = BrowserWindow.getFocusedWindow();
+    if (win) {
+      const mode = store.loadSettings().devtoolsMode || 'right';
+      win.webContents.openDevTools({ mode });
+    }
+  });
 }
 
 // ── IPC ────────────────────────────────────────────────────────
@@ -361,11 +499,49 @@ async function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       webviewTag: true,
+      backgroundThrottling: false,
       preload: path.join(__dirname, 'preload.js'),
     },
   });
 
   win.setMenuBarVisibility(false);
+
+  // ── Global keyboard shortcuts ───────────────────────────
+  // Register global shortcut for F12 (works even when webview has focus)
+  const registered = globalShortcut.register('F12', () => {
+    console.log('[F12] globalShortcut triggered');
+    const focusedWin = BrowserWindow.getFocusedWindow();
+    if (focusedWin) {
+      console.log('[F12] sending toggle to renderer');
+      focusedWin.webContents.send('toggle-webview-devtools');
+    } else {
+      console.log('[F12] no focused window');
+    }
+  });
+  console.log('[F12] globalShortcut registered:', registered);
+  globalShortcut.register('CommandOrControl+Shift+I', () => {
+    const focusedWin = BrowserWindow.getFocusedWindow();
+    if (focusedWin) {
+      focusedWin.webContents.send('toggle-webview-devtools');
+    }
+  });
+
+  // If F12 globalShortcut was blocked, register fallback keys
+  if (!registered) {
+    const fallbackReg = globalShortcut.register('F2', () => {
+      const w = BrowserWindow.getFocusedWindow();
+      if (w) w.webContents.send('toggle-webview-devtools');
+    });
+    globalShortcut.register('CommandOrControl+F12', () => {
+      const w = BrowserWindow.getFocusedWindow();
+      if (w) w.webContents.send('toggle-webview-devtools');
+    });
+  }
+
+  // Unregister shortcuts when window closes
+  win.on('closed', () => {
+    globalShortcut.unregisterAll();
+  });
 
   if (isDev) {
     // Dev: try Metro server first
@@ -379,6 +555,18 @@ async function createWindow() {
   }
 
   win.webContents.once('did-finish-load', () => loadExtensions());
+
+  // Log any renderer errors to console
+  win.webContents.on('console-message', (_, level, msg, line, src) => {
+    console.log(`[renderer:${level}] ${msg} (${src}:${line})`);
+  });
+
+  // Catch webview load failures
+  win.webContents.on('did-fail-load', (_, code, desc, url) => {
+    console.error(`[main] Failed to load ${url}: ${desc} (code=${code})`);
+  });
+
+
 }
 
 async function loadDist(win) {
@@ -403,6 +591,9 @@ async function loadDist(win) {
 
 // ── App lifecycle ──────────────────────────────────────────────
 app.whenReady().then(() => {
+  store = createStore(app.getPath('userData'));
+  setupDataIpc();
+  setupContextMenuIpc();
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -410,6 +601,11 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  globalShortcut.unregisterAll();
   localServer?.close();
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll();
 });

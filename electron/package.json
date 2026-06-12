@@ -23,7 +23,9 @@
     },
     "files": [
       "main.js",
-      "preload.js"
+      "preload.js",
+      "store.js",
+      "extension-preload.js"
     ],
     "extraResources": [
       {
@@ -35,7 +37,6 @@
       }
     ],
     "win": {
-      "icon": "../assets/favicon.ico",
       "target": [
         {
           "target": "nsis",
@@ -43,7 +44,8 @@
             "x64"
           ]
         }
-      ]
+      ],
+      "signAndEditExecutable": false
     }
   }
 }

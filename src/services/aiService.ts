@@ -1,4 +1,20 @@
+/**
+ * aiService.ts — DeepSeek API client
+ *
+ * Settings stored via Electron IPC (persistent JSON) when available,
+ * falls back to AsyncStorage for native/web.
+ */
+
 import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// ── Detect Electron ──────────────────────────────────────────
+const IS_ELECTRON =
+  typeof window !== 'undefined' &&
+  typeof (window as any).electronAPI?.store !== 'undefined';
+
+function getStore(): any {
+  return (window as any).electronAPI?.store;
+}
 
 // ── DeepSeek API ──────────────────────────────────────────────
 const DEEPSEEK_BASE  = 'https://api.deepseek.com/v1';
@@ -11,6 +27,9 @@ export interface Settings {
 
 export async function getSettings(): Promise<Settings> {
   try {
+    if (IS_ELECTRON) {
+      return await getStore().loadSettings();
+    }
     const raw = await AsyncStorage.getItem(SETTINGS_KEY);
     return raw ? JSON.parse(raw) : { deepseekApiKey: '' };
   } catch {
@@ -19,7 +38,11 @@ export async function getSettings(): Promise<Settings> {
 }
 
 export async function saveSettings(s: Settings): Promise<void> {
-  await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  if (IS_ELECTRON) {
+    await getStore().saveSettings(s);
+  } else {
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  }
 }
 
 // ── Types ─────────────────────────────────────────────────────

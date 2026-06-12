@@ -17,6 +17,7 @@ import {
   TouchableOpacity,
   View,
   KeyboardAvoidingView,
+  Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import WebView from '../components/WebViewBridge';
@@ -39,12 +40,17 @@ import {
   loadBookmarks,
   loadHistory,
   removeBookmark,
+  clearHistory,
+  deleteHistoryByAge,
 } from '../services/storageService';
 
 // ── Constants ─────────────────────────────────────────────────
 const IS_IOS     = Platform.OS === 'ios';
 const IS_ANDROID = Platform.OS === 'android';
 const IS_WEB     = Platform.OS === 'web';
+const IS_ELECTRON =
+  typeof window !== 'undefined' &&
+  typeof (window as any).electronAPI?.store !== 'undefined';
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 const TAB_W     = IS_WEB ? 200 : 140;
@@ -102,6 +108,24 @@ const EXTRACT_JS = `(function(){
   }
 })();true;`;
 
+const CONTEXT_MENU_JS = `(function(){
+  if (window.__lb_context_menu_injected) return;
+  window.__lb_context_menu_injected = true;
+  function handleContextMenu(e) {
+    var t = e.target;
+    while (t && t.tagName !== 'A') t = t.parentElement;
+    if (t && t.tagName === 'A') {
+      e.preventDefault();
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        type: 'contextmenu',
+        ctxType: 'link',
+        ctxUrl: t.href
+      }));
+    }
+  }
+  window.addEventListener('contextmenu', handleContextMenu, true);
+})();true;`;
+
 // ── Types ─────────────────────────────────────────────────────
 interface Tab {
   id: string;
@@ -147,6 +171,93 @@ export default function BrowserScreen() {
   const wvRefs = useRef<Map<string, WebView>>(new Map());
 
   const activeTab = tabs.find(t => t.id === activeId) ?? tabs[0];
+
+  // ── Context menu actions (Electron) ──────────────────────
+  const handleContextNewTab = useCallback((url: string) => {
+    if (!url) return;
+    const t = newTab(url);
+    setTabs(p => [...p, t]);
+    setActiveId(t.id);
+  }, []);
+
+  const handleContextCopyLink = useCallback((url: string) => {
+    if (!url) return;
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(url).catch(() => {});
+    }
+  }, []);
+
+  // Listen for context actions from Electron main process
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (!api?.onContextAction) return;
+    const cleanup = api.onContextAction((action: { action: string; url: string }) => {
+      if (action.action === 'new-tab' && action.url) {
+        const t = newTab(action.url);
+        setTabs(p => [...p, t]);
+        setActiveId(t.id);
+      }
+    });
+    return cleanup;
+  }, []);
+
+  // ── F12 / DevTools toggle ────────────────────────────────
+  // Use a ref so handlers always have the latest activeId
+  const activeIdRef = useRef(activeId);
+  activeIdRef.current = activeId;
+  
+  // Store webContentsId per tab (set by WebView when dom-ready fires)
+  const wcIdMap = useRef<Map<string, number>>(new Map());
+  
+  const handleWebContentsIdReady = useCallback((tabId: string, wcId: number) => {
+    wcIdMap.current.set(tabId, wcId);
+  }, []);
+  
+  const openWebviewDevTools = useCallback(async () => {
+    const api = (window as any).electronAPI;
+    if (!api) return;
+    
+    const id = activeIdRef.current;
+    
+    // Try stored webContentsId first (reliable)
+    const storedWcId = wcIdMap.current.get(id);
+    if (storedWcId && api.toggleWebviewDevTools) {
+      try {
+        await api.toggleWebviewDevTools(storedWcId);
+        return;
+      } catch {}
+    }
+    
+    // Try direct from the webview ref (fallback)
+    const webview = wvRefs.current.get(id);
+    if (webview) {
+      try {
+        const wcId = webview.getWebContentsId?.() ?? null;
+        if (wcId && api.toggleWebviewDevTools) {
+          await api.toggleWebviewDevTools(wcId);
+          return;
+        }
+      } catch {}
+    }
+    
+    // Last resort: main window DevTools
+    if (api.openMainDevTools) {
+      await api.openMainDevTools();
+    }
+  }, []);
+
+  // Listen for F12 from main process (globalShortcut)
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (api?.onToggleDevTools) {
+      return api.onToggleDevTools(openWebviewDevTools);
+    }
+  }, [openWebviewDevTools]);
+
+  const [devToolsMode, setDevToolsMode] = useState<string>('right');
+  useEffect(() => {
+    (window as any).electronAPI?.getDevToolsMode?.().then((m: string) => setDevToolsMode(m || 'right'));
+  }, []);
 
   const updateTab = useCallback((id: string, patch: Partial<Tab>) =>
     setTabs(prev => prev.map(t => t.id === id ? { ...t, ...patch } : t)), []);
@@ -411,6 +522,30 @@ export default function BrowserScreen() {
       const data = JSON.parse(e.nativeEvent.data);
       if (data.type === 'content') updateTab(id, { pageContent: { title: data.title, text: data.text } });
       if (data.type === 'install-ext' && data.extId) handleInstallFromId(data.extId);
+      if (data.type === 'contextmenu') {
+        const api = (window as any).electronAPI;
+        if (api) {
+          if (data.ctxType === 'text' && data.ctxText) {
+            api.showTextContextMenu(data.ctxText);
+          } else if (data.ctxType === 'link' && data.ctxUrl) {
+            api.showLinkContextMenu(data.ctxUrl);
+          } else {
+            api.showPageContextMenu();
+          }
+        } else if (IS_ANDROID || IS_IOS) {
+          if (data.ctxType === 'link' && data.ctxUrl) {
+            Alert.alert(
+              '連結選項',
+              data.ctxUrl,
+              [
+                { text: '在新分頁開啟', onPress: () => handleContextNewTab(data.ctxUrl) },
+                { text: '複製連結', onPress: () => handleContextCopyLink(data.ctxUrl) },
+                { text: '取消', style: 'cancel' }
+              ]
+            );
+          }
+        }
+      }
     } catch {}
   }, [updateTab, handleInstallFromId]);
 
@@ -568,6 +703,86 @@ export default function BrowserScreen() {
           </TouchableOpacity>
 
           {/* Extensions — Electron only */}
+          {/* ── Clear History ─────────────────────────────── */}
+          <Text style={[S.settingsLabel, { marginTop: 24 }]}>清除瀏覽記錄</Text>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+            {[
+              { label: '1 天', ms: Date.now() - 86400000 },
+              { label: '7 天', ms: Date.now() - 7 * 86400000 },
+              { label: '1 個月', ms: Date.now() - 30 * 86400000 },
+              { label: '1 年', ms: Date.now() - 365 * 86400000 },
+              { label: '全部清除', ms: Infinity },
+            ].map(opt => (
+              <TouchableOpacity
+                key={opt.label}
+                style={{
+                  paddingHorizontal: 14,
+                  paddingVertical: 8,
+                  borderRadius: 8,
+                  backgroundColor: colors.accentRed,
+                }}
+                onPress={async () => {
+                  const store = (window as any).electronAPI?.store;
+                  if (IS_ELECTRON && store) {
+                    if (opt.ms === Infinity) {
+                      await store.clearHistory();
+                    } else {
+                      await store.deleteHistoryByAge(opt.ms);
+                    }
+                  } else {
+                    // Fallback for mobile/web via AsyncStorage
+                    if (opt.ms === Infinity) {
+                      await clearHistory();
+                    } else {
+                      await deleteHistoryByAge(opt.ms);
+                    }
+                  }
+                  setHistoryItems([]);
+                  showToast(`已清除 ${opt.label} 的瀏覽記錄`);
+                  closePanel();
+                }}
+              >
+                <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600' }}>{opt.label}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {/* ── DevTools dock mode (Electron only) ────────── */}
+          {eAPI && (
+            <>
+              <Text style={[S.settingsLabel, { marginTop: 24 }]}>開發者工具 (F12)</Text>
+              <Text style={S.settingsHint}>選擇 DevTools 顯示位置（按 F12 會對目前網頁開 DevTools，Network 流量才會正確）</Text>
+              <View style={{ flexDirection: 'row', gap: 6, marginBottom: 12 }}>
+                {[
+                  { label: '右側', mode: 'right' },
+                  { label: '下方', mode: 'bottom' },
+                  { label: '獨立視窗', mode: 'detach' },
+                ].map(opt => (
+                  <TouchableOpacity
+                    key={opt.mode}
+                    style={{
+                      flex: 1,
+                      paddingVertical: 10,
+                      borderRadius: 8,
+                      alignItems: 'center',
+                      backgroundColor: devToolsMode === opt.mode ? colors.accent : (isDark ? '#1a1a30' : '#e8e8f4'),
+                    }}
+                    onPress={() => {
+                      setDevToolsMode(opt.mode);
+                      (window as any).electronAPI?.setDevToolsMode?.(opt.mode);
+                    }}
+                  >
+                    <Text style={{
+                      fontSize: 12,
+                      fontWeight: '600',
+                      color: devToolsMode === opt.mode ? '#fff' : colors.text,
+                    }}>{opt.label}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </>
+          )}
+
           {eAPI && (
             <>
               <Text style={[S.settingsLabel, { marginTop: 24 }]}>Chrome 擴充套件</Text>
@@ -744,6 +959,11 @@ export default function BrowserScreen() {
               </TouchableOpacity>
             ))}
 
+            {eAPI && (
+              <TouchableOpacity style={S.navBtn} onPress={openWebviewDevTools}>
+                <Text style={S.navBtnTxt}>🛠</Text>
+              </TouchableOpacity>
+            )}
             <TouchableOpacity style={S.navBtn} onPress={toggleTheme}>
               <Text style={S.navBtnTxt}>{isDark ? '☀️' : '🌙'}</Text>
             </TouchableOpacity>
@@ -780,6 +1000,9 @@ export default function BrowserScreen() {
                     updateTab(tab.id, { isLoading: false });
                     const wv = wvRefs.current.get(tab.id);
                     wv?.injectJavaScript(EXTRACT_JS);
+                    if (IS_ANDROID || IS_IOS) {
+                      wv?.injectJavaScript(CONTEXT_MENU_JS);
+                    }
                     // Inject CWS fix + install button on Chrome Web Store pages
                     if (tab.url.includes('chromewebstore.google.com') ||
                         tab.url.includes('chrome.google.com/webstore')) {
@@ -787,7 +1010,15 @@ export default function BrowserScreen() {
                     }
                   }}
                   onNavigationStateChange={nav => onNavState(tab.id, nav)}
+                  onOpenWindow={(syntheticEvent) => {
+                    const { nativeEvent } = syntheticEvent;
+                    const { targetUrl } = nativeEvent;
+                    handleContextNewTab(targetUrl);
+                  }}
                   onMessage={e => onMessage(tab.id, e)}
+                  onContextMenuOpenNewTab={handleContextNewTab}
+                  onContextMenuCopyLink={handleContextCopyLink}
+                  onWebContentsIdReady={(wcId) => handleWebContentsIdReady(tab.id, wcId)}
                   style={S.wv}
                 />
               </View>
